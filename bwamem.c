@@ -110,7 +110,7 @@ mem_opt_t *mem_opt_init()
 }
 
 /***************************
- * Collection SA invervals *
+ * Collection SA intervals *
  ***************************/
 
 #define intv_lt(a, b) ((a).info < (b).info)
@@ -136,38 +136,43 @@ static void smem_aux_destroy(smem_aux_t *a)
 	free(a->mem.a); free(a->mem1.a);
 	free(a);
 }
-
+/* collects SMEM intervals for one query */
 static void mem_collect_intv(const mem_opt_t *opt, const bwt_t *bwt, int len, const uint8_t *seq, smem_aux_t *a)
 {
-	int i, k, x = 0, old_n;
-	int start_width = 1;
-	int split_len = (int)(opt->min_seed_len * opt->split_factor + .499);
+	int i, k, x = 0, old_n; /* i,k: loop counters, x=0: current query position index used when scanning seq */
+	int start_width = 1; /* initial seed width parameter passed into bwt_smem1() */
+	int split_len = (int)(opt->min_seed_len * opt->split_factor + .499); /* compute the integer split length threshold */
 	a->mem.n = 0;
 	// first pass: find all SMEMs
-	while (x < len) {
-		if (seq[x] < 4) {
+	while (x < len) { /* scan along the query, but increment not always by 1; bwt_smem1 returns a new x */
+		if (seq[x] < 4) { /* only search from positions that are A/C/G/T (encoded 0..3). Positions with >=4 are ambiguous (e.g. N) and are skipped: ++x */
+			/* At each valid base, call bwt_smem1() → returns all SMEMs overlapping that position */
+			/*It writes results to a->mem1 (a bwtintv_v) and uses a->tmpv scratch vectors */
 			x = bwt_smem1(bwt, len, seq, x, start_width, &a->mem1, a->tmpv);
-			for (i = 0; i < a->mem1.n; ++i) {
-				bwtintv_t *p = &a->mem1.a[i];
+			for (i = 0; i < a->mem1.n; ++i) { /* iterate the intervals returned by bwt_smem1 */
+				bwtintv_t * p = &a->mem1.a[i]; /* bwtintv_t: Represents an interval [l, r) in the FM-index with size r - l = number of hits */
+				/* info: packs (start, end) positions in the query */
 				int slen = (uint32_t)p->info - (p->info>>32); // seed length
-				if (slen >= opt->min_seed_len)
-					kv_push(bwtintv_t, a->mem, *p);
+				if (slen >= opt->min_seed_len) /* filter out too short seeds: */
+					                           /*If the seed length meets the minimum, push this bwtintv_t into */
+					                           	/* a->mem (the final vector). kv_push is the klib macro to append and resize as needed. */
+					kv_push(bwtintv_t, a->mem, *p); /* mem: final list of intervals (all collected seeds) */
 			}
 		} else ++x;
 	}
-	// second pass: find MEMs inside a long SMEM
-	old_n = a->mem.n;
-	for (k = 0; k < old_n; ++k) {
+	// second pass: find MEMs inside a long SMEM: for each SMEM found in the first pass, look inside long SMEMs for additional MEMs (to split big seeds into informative sub-seeds)
+	old_n = a->mem.n; /* remember how many intervals were collected by first pass. This prevents the for-loop from iterating over newly-added intervals in this pass (we only want to inspect the original set) */
+	for (k = 0; k < old_n; ++k) { /* iterate those original intervals */
 		bwtintv_t *p = &a->mem.a[k];
 		int start = p->info>>32, end = (int32_t)p->info;
-		if (end - start < split_len || p->x[2] > opt->split_width) continue;
-		bwt_smem1(bwt, len, seq, (start + end)>>1, p->x[2]+1, &a->mem1, a->tmpv);
-		for (i = 0; i < a->mem1.n; ++i)
+		if (end - start < split_len || p->x[2] > opt->split_width) continue; // the seed length end-start is at least the split_len threshold and the seed is not too repetitive
+		bwt_smem1(bwt, len, seq, (start + end)>>1, p->x[2]+1, &a->mem1, a->tmpv); // Call bwt_smem1 at the middle of the existing SMEM ((start + end)>>1) to find interior maximal matches
+		for (i = 0; i < a->mem1.n; ++i) // For each returned interval in a->mem1, check its length and kv_push it into a->mem if it meets min_seed_len
 			if ((uint32_t)a->mem1.a[i].info - (a->mem1.a[i].info>>32) >= opt->min_seed_len)
 				kv_push(bwtintv_t, a->mem, a->mem1.a[i]);
 	}
-	// third pass: LAST-like
-	if (opt->max_mem_intv > 0) {
+	// third pass: LAST-like: optionally run a LAST-like seeding strategy to add more seeds, controlled by opt->max_mem_intv
+	if (opt->max_mem_intv > 0) { // only run this if the option is enabled (>0)
 		x = 0;
 		while (x < len) {
 			if (seq[x] < 4) {
@@ -183,7 +188,7 @@ static void mem_collect_intv(const mem_opt_t *opt, const bwt_t *bwt, int len, co
 			} else ++x;
 		}
 	}
-	// sort
+	// sort: Seeds are sorted by info (query position), which makes downstream chaining/extension easier.
 	ks_introsort(mem_intv, a->mem.n, a->mem.a);
 }
 
@@ -198,17 +203,19 @@ typedef struct {
 } mem_seed_t; // unaligned memory
 
 typedef struct {
-	int n, m, first, rid;
+	int n, m, first, rid; // number of seeds, allocated capacity, index of first seed (used later in extension), reference contig ID
 	uint32_t w:29, kept:2, is_alt:1;
-	float frac_rep;
-	int64_t pos;
-	mem_seed_t *seeds;
+	float frac_rep; // fraction of repetitive seeds
+	int64_t pos; // position of the first seed (for sorting in kbtree)
+	mem_seed_t *seeds; // dynamic array of seeds
 } mem_chain_t;
 
-typedef struct { size_t n, m; mem_chain_t *a;  } mem_chain_v;
+typedef struct { size_t n, m; mem_chain_t *a;  } mem_chain_v; //Vector of chains (used for final output)
 
 #include "kbtree.h"
 
+// Define a balanced tree (kbtree) to store chains, sorted by pos.
+// This lets us quickly find the "nearest" chain to merge a new seed into.
 #define chain_cmp(a, b) (((b).pos < (a).pos) - ((a).pos < (b).pos))
 KBTREE_INIT(chn, mem_chain_t, chain_cmp)
 
@@ -221,21 +228,29 @@ static int test_and_merge(const mem_opt_t *opt, int64_t l_pac, mem_chain_t *c, c
 	rend = last->rbeg + last->len;
 	if (seed_rid != c->rid) return 0; // different chr; request a new chain
 	if (p->qbeg >= c->seeds[0].qbeg && p->qbeg + p->len <= qend && p->rbeg >= c->seeds[0].rbeg && p->rbeg + p->len <= rend)
-		return 1; // contained seed; do nothing
+		return 1; // contained seed (inside chain bounds); do nothing = skip
 	if ((last->rbeg < l_pac || c->seeds[0].rbeg < l_pac) && p->rbeg >= l_pac) return 0; // don't chain if on different strand
 	x = p->qbeg - last->qbeg; // always non-negtive
 	y = p->rbeg - last->rbeg;
+	// check co-linearity: x ≈ y → same slope along query vs reference, Within bandwidth opt->w, gap not too large
 	if (y >= 0 && x - y <= opt->w && y - x <= opt->w && x - last->len < opt->max_chain_gap && y - last->len < opt->max_chain_gap) { // grow the chain
+		// if chain has capacity, append new seed.
+		// Otherwise, allocate more memory.
 		if (c->n == c->m) {
 			c->m <<= 1;
 			c->seeds = realloc(c->seeds, c->m * sizeof(mem_seed_t));
 		}
 		c->seeds[c->n++] = *p;
+		// Return 1 if merged, 0 if must create a new chain.
 		return 1;
 	}
 	return 0; // request to add a new chain
 }
 
+// Computes chain weight = effective aligned length.
+// Compute covered length on query. Avoid double-counting overlaps
+// Repeat for reference
+// The effective chain length is the smaller coverage.
 int mem_chain_weight(const mem_chain_t *c)
 {
 	int64_t end;
@@ -257,6 +272,7 @@ int mem_chain_weight(const mem_chain_t *c)
 	return w < 1<<30? w : (1<<30)-1;
 }
 
+// Debugging function: prints chains and their seeds
 void mem_print_chain(const bntseq_t *bns, mem_chain_v *chn)
 {
 	int i, j;
@@ -274,8 +290,10 @@ void mem_print_chain(const bntseq_t *bns, mem_chain_v *chn)
 	}
 }
 
+// Main chaining function
 mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bns, int len, const uint8_t *seq, void *buf)
 {
+	// 1. Initialize: prepare chain vector and kbtree, skip if read shorter than seed
 	int i, b, e, l_rep;
 	int64_t l_pac = bns->l_pac;
 	mem_chain_v chain;
@@ -287,7 +305,9 @@ mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 	tree = kb_init(chn, KB_DEFAULT_SIZE);
 
 	aux = buf? (smem_aux_t*)buf : smem_aux_init();
+	// 2. Collect SMEM intervals: get all SMEMs (seeds) for the read
 	mem_collect_intv(opt, bwt, len, seq, aux);
+	// 3. Compute fraction of repetitive seeds
 	for (i = 0, b = e = l_rep = 0; i < aux->mem.n; ++i) { // compute frac_rep
 		bwtintv_t *p = &aux->mem.a[i];
 		int sb = (p->info>>32), se = (uint32_t)p->info;
@@ -296,6 +316,7 @@ mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 		else e = e > se? e : se;
 	}
 	l_rep += e - b;
+	// 4. Loop over seeds: For repetitive seeds, down-sample to avoid blowing up
 	for (i = 0; i < aux->mem.n; ++i) {
 		bwtintv_t *p = &aux->mem.a[i];
 		int step, count, slen = (uint32_t)p->info - (p->info>>32); // seed length
@@ -306,11 +327,13 @@ mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 			mem_chain_t tmp, *lower, *upper;
 			mem_seed_t s;
 			int rid, to_add = 0;
+			// 5. Build seed object: translate interval to actual reference coordinate and assign query start, lengt and score
 			s.rbeg = tmp.pos = bwt_sa(bwt, p->x[0] + k); // this is the base coordinate in the forward-reverse reference
 			s.qbeg = p->info>>32;
 			s.score= s.len = slen;
 			rid = bns_intv2rid(bns, s.rbeg, s.rbeg + s.len);
 			if (rid < 0) continue; // bridging multiple reference sequences or the forward-reverse boundary; TODO: split the seed; don't discard it!!!
+			// 6. Merge or create new chain
 			if (kb_size(tree)) {
 				kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
 				if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid)) to_add = 1;
@@ -325,6 +348,7 @@ mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 			}
 		}
 	}
+	// 7. Finalize
 	if (buf == 0) smem_aux_destroy(aux);
 
 	kv_resize(mem_chain_t, chain, kb_size(tree));
