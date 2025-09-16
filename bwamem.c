@@ -327,7 +327,7 @@ mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 			mem_chain_t tmp, *lower, *upper;
 			mem_seed_t s;
 			int rid, to_add = 0;
-			// 5. Build seed object: translate interval to actual reference coordinate and assign query start, lengt and score
+			// 5. Build seed object: translate interval to actual reference coordinate and assign query start, length and score
 			s.rbeg = tmp.pos = bwt_sa(bwt, p->x[0] + k); // this is the base coordinate in the forward-reverse reference
 			s.qbeg = p->info>>32;
 			s.score= s.len = slen;
@@ -368,12 +368,17 @@ mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
  * Filtering chains *
  ********************/
 
+// macros to compute the beginning and end positions of a chain in the query
 #define chn_beg(ch) ((ch).seeds->qbeg)
 #define chn_end(ch) ((ch).seeds[(ch).n-1].qbeg + (ch).seeds[(ch).n-1].len)
 
+// defines comparison function for sorting chains
 #define flt_lt(a, b) ((a).w > (b).w)
 KSORT_INIT(mem_flt, mem_chain_t, flt_lt)
 
+// n_ch: number of chains
+// a: array of chains
+// returns number of chains kept after filtering
 int mem_chain_flt(const mem_opt_t *opt, int n_chn, mem_chain_t *a)
 {
 	int i, k;
@@ -388,11 +393,13 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn, mem_chain_t *a)
 		else a[k++] = *c;
 	}
 	n_chn = k;
-	ks_introsort(mem_flt, n_chn, a);
+	ks_introsort(mem_flt, n_chn, a); // Sorts chains in descending weight order (heaviest first)
 	// pairwise chain comparisons
-	a[0].kept = 3;
+	// kept=3: strong keep (no overlap).
+	// kept=2: kept but overlaps significantly
+	a[0].kept = 3; // first chain (heaviest) is always kept
 	kv_push(int, chains, 0);
-	for (i = 1; i < n_chn; ++i) {
+	for (i = 1; i < n_chn; ++i) { // for each chain compare against kept chains
 		int large_ovlp = 0;
 		for (k = 0; k < chains.n; ++k) {
 			int j = chains.a[k];
@@ -415,10 +422,13 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn, mem_chain_t *a)
 			a[i].kept = large_ovlp? 2 : 3;
 		}
 	}
+	// Any chain marked as “shadowed” gets kept=1 (weaker, still useful for MAPQ).
 	for (i = 0; i < chains.n; ++i) {
 		mem_chain_t *c = &a[chains.a[i]];
 		if (c->first >= 0) a[c->first].kept = 1;
 	}
+	// prevent too many secondary chains (kept=1/2) from being extended
+	// allow only up to max_chain_extend
 	free(chains.a);
 	for (i = k = 0; i < n_chn; ++i) { // don't extend more than opt->max_chain_extend .kept=1/2 chains
 		if (a[i].kept == 0 || a[i].kept == 3) continue;
@@ -438,58 +448,77 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn, mem_chain_t *a)
  * De-overlap single-end hits *
  ******************************/
 
+//define a comparator: sort alignments by end coordinates on the reference (re) - used in de-duplication merging
 #define alnreg_slt2(a, b) ((a).re < (b).re)
 KSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
 
+// sorts by score descending, then by reference start (rb), then by query start (qb) if tied - used later to prioritize best alignments
 #define alnreg_slt(a, b) ((a).score > (b).score || ((a).score == (b).score && ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
 KSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
 
+// sorts primarily by score, then prioritizes primary assembly hits over ALT hits, then by hash (random tie-braker)
 #define alnreg_hlt(a, b)  ((a).score > (b).score || ((a).score == (b).score && ((a).is_alt < (b).is_alt || ((a).is_alt == (b).is_alt && (a).hash < (b).hash))))
 KSORT_INIT(mem_ars_hash, mem_alnreg_t, alnreg_hlt)
 
+// varint sort: ALT status first, then score - used in secondary handling
 #define alnreg_hlt2(a, b) ((a).is_alt < (b).is_alt || ((a).is_alt == (b).is_alt && ((a).score > (b).score || ((a).score == (b).score && (a).hash < (b).hash))))
 KSORT_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2)
 
-#define PATCH_MAX_R_BW 0.05f
-#define PATCH_MIN_SC_RATIO 0.90f
+// constants
+#define PATCH_MAX_R_BW 0.05f // maximum allowed relative bandwidth difference between query and reference
+#define PATCH_MIN_SC_RATIO 0.90f // minimum ratio of observed alignment score vs predicted score (to accept patch merge)
 
+// merging 2 overlapping hits - co-linear hits
 int mem_patch_reg(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, uint8_t *query, const mem_alnreg_t *a, const mem_alnreg_t *b, int *_w)
 {
 	int w, score, q_s, r_s;
 	double r;
+	// given 2 alignments test if they should be merged
+	// must be on same reference (rid)
+	// a must start before b
 	if (bns == 0 || pac == 0 || query == 0) return 0;
 	assert(a->rid == b->rid && a->rb <= b->rb);
 	if (a->rb < bns->l_pac && b->rb >= bns->l_pac) return 0; // on different strands
 	if (a->qb >= b->qb || a->qe >= b->qe || a->re >= b->re) return 0; // not colinear
+	// bandwith: difference in span between query and reference gaps
 	w = (a->re - b->rb) - (a->qe - b->qb); // required bandwidth
 	w = w > 0? w : -w; // l = abs(l)
+	// relative bandwith: normalized difference
 	r = (double)(a->re - b->rb) / (b->re - a->rb) - (double)(a->qe - b->qb) / (b->qe - a->qb); // relative bandwidth
 	r = r > 0.? r : -r; // r = fabs(r)
 	if (bwa_verbose >= 4)
 		printf("* potential hit merge between [%d,%d)<=>[%ld,%ld) and [%d,%d)<=>[%ld,%ld), @ %s; w=%d, r=%.4g\n",
 			   a->qb, a->qe, (long)a->rb, (long)a->re, b->qb, b->qe, (long)b->rb, (long)b->re, bns->anns[a->rid].name, w, r);
+	// if alignemnts don't overlap -> require stricter limits
+	// if they overlap -> allow more tolerance
 	if (a->re < b->rb || a->qe < b->qb) { // no overlap on query or on ref
 		if (w > opt->w<<1 || r >= PATCH_MAX_R_BW) return 0; // the bandwidth or the relative bandwidth is too large
 	} else if (w > opt->w<<2 || r >= PATCH_MAX_R_BW*2) return 0; // more permissive if overlapping on both ref and query
 	// global alignment
+	// attempt global alignment in the gap region to check if merging is plausible
 	w += a->w + b->w;
 	w = w < opt->w<<2? w : opt->w<<2;
 	if (bwa_verbose >= 4) printf("* test potential hit merge with global alignment; w=%d\n", w);
 	bwa_gen_cigar2(opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w, bns->l_pac, pac, b->qe - a->qb, query + a->qb, a->rb, b->re, &score, 0, 0);
+	// estimates expected score if 2 regions align cleanly
 	q_s = (int)((double)(b->qe - a->qb) / ((b->qe - b->qb) + (a->qe - a->qb)) * (b->score + a->score) + .499); // predicted score from query
 	r_s = (int)((double)(b->re - a->rb) / ((b->re - b->rb) + (a->re - a->rb)) * (b->score + a->score) + .499); // predicted score from ref
 	if (bwa_verbose >= 4) printf("* score=%d;(%d,%d)\n", score, q_s, r_s);
+	// reject if observed score is too low relative to expectation
 	if ((double)score / (q_s > r_s? q_s : r_s) < PATCH_MIN_SC_RATIO) return 0;
 	*_w = w;
 	return score;
 }
 
+// remove redundant/duplicate alignments
 int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a)
 {
 	int m, i, j;
 	if (n <= 1) return n;
 	ks_introsort(mem_ars2, n, a); // sort by the END position, not START!
+	// initially mark all alignments as unique
 	for (i = 0; i < n; ++i) a[i].n_comp = 1;
+	// iterate through hits and compare with previous ones
 	for (i = 1; i < n; ++i) {
 		mem_alnreg_t *p = &a[i];
 		if (p->rid != a[i-1].rid || p->rb >= a[i-1].re + opt->max_chain_gap) continue; // then no need to go into the loop below
@@ -502,12 +531,12 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns, const uint8_
 			oq = q->qb < p->qb? q->qe - p->qb : p->qe - q->qb; // overlap length on the query
 			mr = q->re - q->rb < p->re - p->rb? q->re - q->rb : p->re - p->rb; // min ref len in alignment
 			mq = q->qe - q->qb < p->qe - p->qb? q->qe - q->qb : p->qe - p->qb; // min qry len in alignment
-			if (or > opt->mask_level_redun * mr && oq > opt->mask_level_redun * mq) { // one of the hits is redundant
+			if (or > opt->mask_level_redun * mr && oq > opt->mask_level_redun * mq) { // one of the hits is too redundant -> discard the weaker one
 				if (p->score < q->score) {
 					p->qe = p->qb;
 					break;
 				} else q->qe = q->qb;
-			} else if (q->rb < p->rb && (score = mem_patch_reg(opt, bns, pac, query, q, p, &w)) > 0) { // then merge q into p
+			} else if (q->rb < p->rb && (score = mem_patch_reg(opt, bns, pac, query, q, p, &w)) > 0) { // then merge q into p - not too redundant
 				p->n_comp += q->n_comp + 1;
 				p->seedcov = p->seedcov > q->seedcov? p->seedcov : q->seedcov;
 				p->sub = p->sub > q->sub? p->sub : q->sub;
@@ -525,7 +554,7 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns, const uint8_
 			else ++m;
 		}
 	n = m;
-	ks_introsort(mem_ars, n, a);
+	ks_introsort(mem_ars, n, a); // resort by score
 	for (i = 1; i < n; ++i) { // mark identical hits
 		if (a[i].score == a[i-1].score && a[i].rb == a[i-1].rb && a[i].qb == a[i-1].qb)
 			a[i].qe = a[i].qb;
@@ -540,6 +569,9 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns, const uint8_
 
 typedef kvec_t(int) int_v;
 
+// mark primary vs secondary hits for single-end reads
+// compare aln to previously kept primary aln -> if significant overlap mark as secondary
+// otherwise add as new primary
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z)
 { // similar to the loop in mem_chain_flt()
 	int i, k, tmp;
@@ -568,8 +600,10 @@ static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *
 	}
 }
 
+// wrapping it all
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id)
 {
+	// initilaize fields and count primaries
 	int i, n_pri;
 	int_v z = {0,0,0};
 	if (n == 0) return 0;
@@ -577,6 +611,7 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 		a[i].sub = a[i].alt_sc = 0, a[i].secondary = a[i].secondary_all = -1, a[i].hash = hash_64(id+i);
 		if (!a[i].is_alt) ++n_pri;
 	}
+	// sort and run overlap filtering
 	ks_introsort(mem_ars_hash, n, a);
 	mem_mark_primary_se_core(opt, n, a, &z);
 	for (i = 0; i < n; ++i) {
@@ -585,6 +620,7 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 		if (!p->is_alt && p->secondary >= 0 && a[p->secondary].is_alt)
 			p->alt_sc = a[p->secondary].score;
 	}
+	// track ALT scores separately
 	if (n_pri >= 0 && n_pri < n) {
 		kv_resize(int, z, n);
 		if (n_pri > 0) ks_introsort(mem_ars_hash2, n, a);
